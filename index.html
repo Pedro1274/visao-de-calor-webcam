@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Visão de calor — Webcam</title>
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      padding: 24px;
+      background: #0c1220;
+      color: #edf2ff;
+      font-family: Arial, sans-serif;
+    }
+
+    main {
+      width: 100%;
+      max-width: 900px;
+      margin: auto;
+    }
+
+    h1 {
+      margin-bottom: 12px;
+    }
+
+    p {
+      color: #c3cde0;
+      line-height: 1.5;
+    }
+
+    .controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin: 20px 0;
+    }
+
+    button {
+      padding: 12px 20px;
+      border: 0;
+      border-radius: 8px;
+      background: #56d4ff;
+      color: #081320;
+      font: inherit;
+      font-weight: bold;
+      cursor: pointer;
+    }
+
+    button:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+
+    #stopButton {
+      background: #ffd166;
+    }
+
+    .preview {
+      overflow: hidden;
+      border: 1px solid #34425b;
+      border-radius: 12px;
+      background: #050914;
+    }
+
+    #outputCanvas {
+      display: block;
+      width: 100%;
+      height: auto;
+    }
+
+    .scale {
+      height: 16px;
+      margin-top: 16px;
+      border-radius: 8px;
+      background: linear-gradient(
+        to right,
+        rgb(0, 0, 64) 0%,
+        rgb(0, 64, 255) 25%,
+        rgb(0, 255, 255) 50%,
+        rgb(255, 255, 0) 75%,
+        rgb(255, 0, 0) 100%
+      );
+    }
+
+    .labels {
+      display: flex;
+      justify-content: space-between;
+      margin-top: 8px;
+      color: #c3cde0;
+      font-size: 14px;
+    }
+
+    #status {
+      min-height: 24px;
+    }
+
+    .note {
+      font-size: 14px;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Visão de calor</h1>
+    <p>Clique em “Iniciar câmera” e permita o acesso à webcam.</p>
+
+    <div class="controls">
+      <button id="startButton" type="button">Iniciar câmera</button>
+      <button id="stopButton" type="button" disabled>Parar câmera</button>
+    </div>
+
+    <p id="status" role="status" aria-live="polite">
+      Câmera desligada.
+    </p>
+
+    <div class="preview">
+      <canvas
+        id="outputCanvas"
+        width="640"
+        height="480"
+        aria-label="Vídeo com filtro de visão de calor"
+      ></canvas>
+    </div>
+
+    <div class="scale" aria-hidden="true"></div>
+    <div class="labels">
+      <span>Menor brilho</span>
+      <span>Maior brilho</span>
+    </div>
+
+    <p class="note">
+      Este efeito simula cores térmicas a partir do brilho da imagem;
+      ele não mede temperatura.
+      Use HTTPS ou o Live Server do VS Code para acessar a webcam.
+      A câmera será desligada ao sair da página ou ocultar a aba.
+    </p>
+
+    <video id="sourceVideo" autoplay muted playsinline hidden></video>
+    <canvas id="sourceCanvas" hidden></canvas>
+  </main>
+
+  <script>
+    "use strict";
+
+    const video = document.getElementById("sourceVideo");
+    const sourceCanvas = document.getElementById("sourceCanvas");
+    const outputCanvas = document.getElementById("outputCanvas");
+    const startButton = document.getElementById("startButton");
+    const stopButton = document.getElementById("stopButton");
+    const status = document.getElementById("status");
+
+    const sourceContext = sourceCanvas.getContext("2d", {
+      willReadFrequently: true
+    });
+    const outputContext = outputCanvas.getContext("2d");
+
+    // Pontos do gradiente, distribuídos igualmente entre brilho 0 e 255.
+    const thermalColors = [
+      [0, 0, 64],
+      [0, 64, 255],
+      [0, 255, 255],
+      [255, 255, 0],
+      [255, 0, 0]
+    ];
+
+    let stream = null;
+    let animationId = null;
+    let running = false;
+    let starting = false;
+
+    // Invalida inicializações pendentes quando a câmera é interrompida.
+    let sessionId = 0;
+
+    function updateButtons() {
+      startButton.disabled = starting || running;
+      stopButton.disabled = !starting && !running;
+    }
+
+    function stopCamera(message = "Câmera desligada.") {
+      sessionId++;
+      running = false;
+      starting = false;
+
+      if (animationId !== null) {
+        cancelAnimationFrame(animationId);
+        animationId = null;
+      }
+
+      if (stream) {
+        stream.getTracks().forEach(track => track.stop());
+        stream = null;
+      }
+
+      video.pause();
+      video.srcObject = null;
+
+      status.textContent = message;
+      updateButtons();
+    }
+
+    function processFrame() {
+      if (!running) return;
+
+      try {
+        // O canvas auxiliar recebe somente o vídeo original.
+        sourceContext.drawImage(
+          video,
+          0,
+          0,
+          sourceCanvas.width,
+          sourceCanvas.height
+        );
+
+        const image = sourceContext.getImageData(
+          0,
+          0,
+          sourceCanvas.width,
+          sourceCanvas.height
+        );
+
+        const pixels = image.data;
+
+        for (let i = 0; i < pixels.length; i += 4) {
+          const red = pixels[i];
+          const green = pixels[i + 1];
+          const blue = pixels[i + 2];
+
+          const brightness =
+            0.299 * red + 0.587 * green + 0.114 * blue;
+
+          // Converte o brilho em uma posição de 0 a 4 no gradiente.
+          const position = (brightness / 255) * 4;
+
+          // No extremo superior, usa o último segmento com fator 1.
+          const segment = Math.min(3, Math.floor(position));
+          const factor = position - segment;
+
+          const firstColor = thermalColors[segment];
+          const secondColor = thermalColors[segment + 1];
+
+          // Interpolação linear entre as duas cores vizinhas.
+          pixels[i] = Math.round(
+            firstColor[0] +
+            (secondColor[0] - firstColor[0]) * factor
+          );
+
+          pixels[i + 1] = Math.round(
+            firstColor[1] +
+            (secondColor[1] - firstColor[1]) * factor
+          );
+
+          pixels[i + 2] = Math.round(
+            firstColor[2] +
+            (secondColor[2] - firstColor[2]) * factor
+          );
+
+          // pixels[i + 3] permanece intacto: preserva o canal alfa.
+        }
+
+        // O resultado é escrito apenas no canvas de saída.
+        outputContext.putImageData(image, 0, 0);
+
+        animationId = requestAnimationFrame(processFrame);
+      } catch (error) {
+        console.error(error);
+        stopCamera("Não foi possível processar o vídeo. Tente novamente.");
+      }
+    }
+
+    function getCameraErrorMessage(error) {
+      switch (error.name) {
+        case "NotAllowedError":
+          return "Acesso negado. Permita o uso da câmera nas configurações do navegador.";
+        case "NotFoundError":
+          return "Nenhuma câmera foi encontrada.";
+        case "NotReadableError":
+          return "Não foi possível acessar a câmera. Ela pode estar em uso por outro aplicativo.";
+        case "OverconstrainedError":
+          return "A câmera não suporta as configurações solicitadas.";
+        case "SecurityError":
+          return "Acesso bloqueado. Use HTTPS ou o Live Server do VS Code.";
+        default:
+          return "Não foi possível iniciar a câmera. Verifique as permissões e use HTTPS ou localhost.";
+      }
+    }
+
+    async function startCamera() {
+      if (running || starting) return;
+
+      if (!sourceContext || !outputContext) {
+        status.textContent = "Este navegador não oferece suporte ao Canvas 2D.";
+        return;
+      }
+
+      if (!window.isSecureContext ||
+          !navigator.mediaDevices?.getUserMedia) {
+        status.textContent =
+          "Webcam indisponível. Use HTTPS ou o Live Server do VS Code em um navegador compatível.";
+        return;
+      }
+
+      starting = true;
+      updateButtons();
+      status.textContent = "Solicitando acesso à câmera…";
+
+      const currentSession = ++sessionId;
+
+      try {
+        const acquiredStream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            width: { ideal: 640 },
+            height: { ideal: 480 },
+            facingMode: "user"
+          },
+          audio: false
+        });
+
+        // Libera uma câmera cuja solicitação foi cancelada enquanto aguardava.
+        if (currentSession !== sessionId || document.hidden) {
+          acquiredStream.getTracks().forEach(track => track.stop());
+
+          if (currentSession === sessionId) {
+            stopCamera();
+          }
+          return;
+        }
+
+        stream = acquiredStream;
+        video.srcObject = stream;
+
+        stream.getVideoTracks().forEach(track => {
+          track.addEventListener("ended", () => {
+            if (currentSession === sessionId) {
+              stopCamera("A câmera foi desconectada ou interrompida.");
+            }
+          }, { once: true });
+        });
+
+        await video.play();
+
+        if (currentSession !== sessionId) return;
+
+        // Limita a resolução de processamento, mantendo a proporção.
+        const scale = Math.min(1, 640 / video.videoWidth);
+        const width = Math.max(1, Math.round(video.videoWidth * scale));
+        const height = Math.max(1, Math.round(video.videoHeight * scale));
+
+        sourceCanvas.width = outputCanvas.width = width;
+        sourceCanvas.height = outputCanvas.height = height;
+
+        starting = false;
+        running = true;
+        updateButtons();
+
+        status.textContent = "Câmera ativa. Filtro aplicado em tempo real.";
+        processFrame();
+      } catch (error) {
+        if (currentSession !== sessionId) return;
+
+        console.error(error);
+        stopCamera(getCameraErrorMessage(error));
+      }
+    }
+
+    startButton.addEventListener("click", startCamera);
+    stopButton.addEventListener("click", () => stopCamera());
+
+    window.addEventListener("pagehide", () => stopCamera());
+
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden && (running || starting)) {
+        stopCamera("Câmera desligada. Clique em “Iniciar câmera” para retomar.");
+      }
+    });
+  </script>
+</body>
+</html>
